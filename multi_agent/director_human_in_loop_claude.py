@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 
 # LLM 初始化
-llm = ChatTongyi(model="qwen3-max-preview", api_key=os.getenv("LLM_SK"))
+llm = ChatTongyi(model="qwen3.7-max", api_key=os.getenv("LLM_SK"))
 
 
 class State(TypedDict):
