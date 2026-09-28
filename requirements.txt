@@ -1,0 +1,5 @@
+langgraph==1.2.12
+langchain==1.4.2
+langchain-core==1.6.5
+langchain-qwq==0.3.5
+pydantic==2.12.5

@@ -2,10 +2,11 @@
 简化版 Human-in-the-Loop 示例
 演示核心机制，不依赖 LLM API
 """
-from typing import TypedDict, Literal
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import Command, interrupt
+from typing import Literal, TypedDict
+
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, Interrupt, interrupt
 
 
 class SimpleState(TypedDict):
@@ -26,15 +27,15 @@ def step1(state: SimpleState) -> dict:
 def human_check(state: SimpleState) -> Command[Literal["step2", "step1"]]:
     """人工检查点：使用 interrupt() 暂停等待人工输入"""
     print("\n⏸️  暂停等待人工审批...")
-    
+
     # interrupt() 会暂停执行，返回值是人工输入的内容
     # 使用interrupt()进行中断，中断后就会跳出本次graph迭代产生的stream
     # interrupt()函数实现暂停等待人工输入
-    # LangGraph会保存当前执行上下文（包括局部变量、调用栈等），在检查点存储器中记录中断状态，执行上下文会被序列化
+    # LangGraph只把图的State和待处理的中断记录到检查点存储器（checkpointer），不会保存Python的局部变量和调用栈
     # graph.stream()调用在遇到中断时会停止迭代，完全停止当前的stream
     print("\n⏸️ 执行interrupt()中断前")
-    # 执行上下文恢复：会精确恢复到中断时的执行位置
-    # 恢复后，从这里等暂停点继续执行直到下一个中断或结束
+    # 恢复时不是从中断的那一行接着跑：LangGraph会从本节点第一行重新执行，这一次interrupt()不再暂停，直接返回Command(resume=...)的值
+    # 所以上面两行print在恢复后会再打印一遍；interrupt()之前不要放有副作用的操作（调用LLM、写库、发消息等）
     # 生产级实现方案：在实际生产环境中的“客户端-服务器”模式下，如果服务端此时中断返回给客户端等待客户端提交，客户提交信息后服务端恢复中断之前的对话
     # 通过数据库/Redis方式持久化序列化后的会话上下文信息
     # 设计唯一会话ID: 关联用户和执行状态
@@ -67,7 +68,7 @@ def human_check(state: SimpleState) -> Command[Literal["step2", "step1"]]:
     print("\n⏸️ 中断恢复，继续往下执行")
     # 这里interrupt返回的feedback，就是用户输入的 'approve'，就是Command(resume=...)中resume的值
     print(f"📥 收到人工反馈: {feedback}")
-    
+
     # 根据人工反馈决定下一步
     if "approve" in str(feedback).lower():
         # 这里的"goto"定义了，中断恢复后跳转到哪里执行
@@ -96,7 +97,18 @@ builder.add_edge("step1", "human_check")
 builder.add_edge("step2", END)
 
 # 编译时必须提供 checkpointer
-graph = builder.compile(checkpointer=MemorySaver())
+graph = builder.compile(checkpointer=InMemorySaver())
+
+
+def stream_until_pause(graph_input: dict | Command, config: dict) -> tuple[Interrupt, ...]:
+    """开一个新的 stream 跑到结束或下一个 interrupt()，返回本轮挂起的中断（为空表示流程已结束）"""
+    pending: tuple[Interrupt, ...] = ()
+    # version="v2"：每个事件都是带 type/ns/data 的 StreamPart；遇到中断时 data 里是 {"__interrupt__": (Interrupt, ...)}
+    for part in graph.stream(graph_input, config, stream_mode="updates", version="v2"):
+        print(f"📍 事件: {part['data']}")
+        if "__interrupt__" in part["data"]:
+            pending = part["data"]["__interrupt__"]
+    return pending
 
 
 def run_simple_demo():
@@ -104,35 +116,28 @@ def run_simple_demo():
     print("\n" + "="*50)
     print("简化版 Human-in-the-Loop Demo")
     print("="*50 + "\n")
-    
+
     config = {"configurable": {"thread_id": "simple_001"}}
-    
+
     # 启动流程
     print("🚀 启动流程...\n")
-    for event in graph.stream(
+    pending = stream_until_pause(
         {"input": "测试数据", "step1_result": "", "step2_result": "", "approved": False},
         config,
-        stream_mode="updates"
-    ):
-        print(f"📍 事件: {event}")
-    
-    # 检查是否中断
-    state = graph.get_state(config)
-    if state.next:
+    )
+
+    # 驳回会回到 step1 并在 human_check 再次暂停，所以要循环到没有待处理的中断为止
+    while pending:
         print("\n💡 流程已暂停，输入 'approve' 继续，其他内容将重新执行步骤1")
         human_input = input("👤 你的决定: ")
-        
+
         print("\n🔄 继续执行...\n")
-        # 再次开启一个新的stream，指定Command恢复到中断前的位置执行
-        for event in graph.stream(
-            Command(resume=human_input), # LangGraph Command和interrupt是实现 human-in-the-loop 的关键，通过Command对象实现动态路由，
-                # Command(goto=..., update=...): 动态路由控制
-                # 人工输入通过Command(resume=...)传回给图执行器
-            config,
-            stream_mode="updates"
-        ):
-            print(f"📍 事件: {event}")
-    
+        # 再次开启一个新的stream，同一个 thread_id 把它接回暂停处
+        # LangGraph Command和interrupt是实现 human-in-the-loop 的关键，通过Command对象实现动态路由，
+        # Command(goto=..., update=...): 动态路由控制
+        # 人工输入通过Command(resume=...)传回给图执行器
+        pending = stream_until_pause(Command(resume=human_input), config)
+
     print("\n✅ 流程完成！")
     final_state = graph.get_state(config)
     print(f"📊 最终结果: {final_state.values.get('step2_result', 'N/A')}")

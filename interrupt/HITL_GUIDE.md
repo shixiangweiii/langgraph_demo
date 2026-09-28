@@ -4,7 +4,7 @@
 
 **Human-in-the-Loop** 是指在自动化流程中加入人工干预点，允许人工审批、修改或决策，确保关键步骤的质量和可控性。
 
-## 🔑 LangGraph 1.0.7 中的 HITL 关键 API
+## 🔑 LangGraph 1.2 中的 HITL 关键 API
 
 ### 1. `interrupt()` 函数
 ```python
@@ -12,14 +12,19 @@ from langgraph.types import interrupt
 
 # 暂停执行，等待人工输入
 human_feedback = interrupt(value)
+
+# 1.1+ 可以声明回复格式：恢复值先按它校验，interrupt() 返回校验后的对象
+decision = interrupt(value, response_schema=PlanDecision)  # Pydantic 模型 / TypedDict / dataclass
 ```
 
 **作用**：
 - 暂停图的执行
 - 返回值是人工通过 `Command(resume=...)` 提供的反馈
+- 恢复时节点会**从第一行重新执行**，这一次 `interrupt()` 直接返回恢复值；LangGraph 不保存局部变量和调用栈，所以 `interrupt()` 之前不要放调用 LLM、写库之类有副作用的操作
 
 **参数**：
 - `value`: 任意数据，通常包含需要人工审核的信息
+- `response_schema`（可选）: 回复格式。客户端从 `Interrupt.response_schema` 拿到对应的 JSON Schema；恢复值校验失败会从 `graph.stream()` 抛出 `pydantic.ValidationError`，线程仍停在原中断，用合法的值再恢复一次即可
 
 ### 2. `Command` 对象
 ```python
@@ -39,10 +44,10 @@ Command(goto="node_name", update={...})
 
 ### 3. Checkpointer（必需）
 ```python
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.memory import InMemorySaver  # MemorySaver 是它的旧别名
 
 # HITL 必须使用 checkpointer
-graph = builder.compile(checkpointer=MemorySaver())
+graph = builder.compile(checkpointer=InMemorySaver())
 ```
 
 **为什么必需**：
@@ -100,39 +105,40 @@ def edit_node(state: State) -> Command[Literal["execute"]]:
 graph = create_graph()
 config = {"configurable": {"thread_id": "session_001"}}
 
-# 2. 启动执行
-initial_state = {"input": "用户输入"}
-for event in graph.stream(initial_state, config):
-    print(event)
 
-# 3. 检查是否中断
-state_snapshot = graph.get_state(config)
+def stream_until_pause(graph_input):
+    """开一个新的 stream 跑到结束或下一个 interrupt()，返回本轮挂起的中断"""
+    pending = ()
+    # version="v2"：每个事件都是带 type/ns/data 的 StreamPart；中断出现在 data["__interrupt__"]
+    for part in graph.stream(graph_input, config, stream_mode="updates", version="v2"):
+        print(part["data"])
+        if "__interrupt__" in part["data"]:
+            pending = part["data"]["__interrupt__"]
+    return pending
 
-# 4. 如果中断，获取中断信息
-while state_snapshot.next:
-    # 获取中断信息
-    if state_snapshot.tasks:
-        task = state_snapshot.tasks[0]
-        if task.interrupts:
-            interrupt_value = task.interrupts[0].value
-            print(f"中断信息: {interrupt_value}")
-    
+
+# 2. 启动执行：遇到 interrupt() 时本轮 stream 就结束了
+pending = stream_until_pause({"input": "用户输入"})
+
+# 3. 驳回/重做会再次暂停，所以循环到没有待处理的中断为止
+while pending:
+    # 4. 获取中断信息（节点传给 interrupt() 的 value）
+    print(f"中断信息: {pending[0].value}")
+
     # 5. 获取人工输入
     human_input = input("请输入: ")
-    
-    # 6. 恢复执行
-    for event in graph.stream(Command(resume=human_input), config):
-        print(event)
-    
-    # 7. 更新状态快照
-    state_snapshot = graph.get_state(config)
+
+    # 6. 恢复执行：同一个 thread_id 把新的 stream 接回暂停处
+    pending = stream_until_pause(Command(resume=human_input))
 
 print("流程完成!")
 ```
 
+也可以在 stream 结束后用 `graph.get_state(config).interrupts` 读取挂起的中断；`graph.invoke(..., version="v2")` 返回 `GraphOutput`，最终状态在 `.value`、中断在 `.interrupts`。`stream()` / `invoke()` 默认仍是 `version="v1"`（普通 dict）。
+
 ## 🏗️ Demo 架构说明
 
-### 完整版 Demo (human_in_loop_demo.py)
+### 完整版 Demo (multi_agent/director_human_in_loop_claude.py)
 
 **流程图**：
 ```
@@ -157,7 +163,7 @@ END
 1. **计划审批**：审批 AI 生成的执行计划
 2. **结果审核**：确认最终执行结果
 
-### 简化版 Demo (simple_hitl_demo.py)
+### 简化版 Demo (interrupt/simple_hitl_demo.py)
 
 **流程图**：
 ```
@@ -182,17 +188,28 @@ interrupt({
 ```
 
 ### 2. 健壮的反馈处理
+用 `response_schema` 声明回复格式，把"字符串还是 dict"的解析集中到 schema 里，节点只处理校验后的对象：
 ```python
-# 支持多种输入格式
-if isinstance(feedback, dict):
-    action = feedback.get("action")
-else:
-    action = str(feedback).lower()
+class PlanDecision(BaseModel):
+    action: Literal["approve", "reject", "revise"]
+    feedback: str = ""
 
-# 提供默认行为
-if action not in ["approve", "reject"]:
-    action = "reject"  # 默认拒绝
+    @model_validator(mode="before")
+    @classmethod
+    def _from_text(cls, data):
+        # 兼容只能回一句话的客户端（如控制台）：把字符串规整成 {"action", "feedback"}
+        if isinstance(data, str):
+            lowered = data.strip().lower()
+            action = "approve" if "approve" in lowered else "reject" if "reject" in lowered else "revise"
+            return {"action": action, "feedback": data.strip()}
+        return data
+
+
+decision = interrupt({"message": "请审批"}, response_schema=PlanDecision)
+if decision.action == "approve":
+    ...
 ```
+字符串和合法的 dict 都能用；非法的 dict（如 `{"action": "maybe"}`）会被校验拦下，线程停在原中断等待重新恢复。
 
 ### 3. 状态更新策略
 ```python
@@ -222,11 +239,11 @@ def approval_node(state: State):
 
 ### 运行完整版
 ```bash
-# 设置环境变量
-export LLM_SK='your_tongyi_api_key'
+# 设置环境变量（DashScope / 通义千问的 API key）
+export LLM_SK='your_dashscope_api_key'
 
-# 运行
-python human_in_loop_demo.py
+# 在仓库根目录运行
+.venv2/bin/python multi_agent/director_human_in_loop_claude.py
 ```
 
 **交互流程**：
@@ -239,7 +256,7 @@ python human_in_loop_demo.py
 
 ### 运行简化版
 ```bash
-python simple_hitl_demo.py
+.venv2/bin/python interrupt/simple_hitl_demo.py
 ```
 
 **交互流程**：
@@ -253,8 +270,9 @@ python simple_hitl_demo.py
 1. **interrupt() 是核心**：暂停执行的关键
 2. **必须使用 checkpointer**：保存中断状态
 3. **Command 控制流转**：动态路由和状态更新
-4. **循环检查 state.next**：处理多次中断
-5. **状态快照管理**：`get_state()` 获取当前状态
+4. **循环处理中断**：驳回/重做后会再次暂停，要循环到没有待处理的中断
+5. **恢复 = 节点重跑**：恢复时节点从第一行重新执行，`interrupt()` 之前不要有副作用
+6. **状态快照管理**：`get_state()` 获取当前状态
 
 ## 🔧 常见问题
 
@@ -262,16 +280,13 @@ python simple_hitl_demo.py
 **A**: interrupt() 需要保存中断时的状态，没有 checkpointer 无法恢复执行。
 
 ### Q2: 如何处理多个连续的人工检查点?
-**A**: 使用 while 循环检查 `state.next`，每次中断后继续循环。
+**A**: 用 while 循环：只要本轮 stream 里出现了 `__interrupt__`（或 `graph.get_state(config).interrupts` 不为空），就获取人工输入并用新的 stream 恢复。
 
 ### Q3: 人工反馈的格式有要求吗?
-**A**: 没有严格要求，可以是字符串、字典等，节点内部自行解析。
+**A**: 不声明 `response_schema` 时没有要求，可以是字符串、字典等，节点内部自行解析；声明了 `response_schema` 时，恢复值会先按它校验，节点拿到的是校验后的对象。
 
-### Q4: 可以跳过中断直接执行吗?
-**A**: 可以，在测试时可以预设反馈：
-```python
-graph.stream(initial_state, config, interrupt_before=["approval_node"])
-```
+### Q4: `interrupt_before` 能跳过中断吗?
+**A**: 不能。`interrupt_before=["node"]` 是静态断点：在该节点执行*之前*额外暂停一次（没有 payload），用 `graph.stream(None, config)` 继续；节点里的 `interrupt()` 之后照样会触发。测试时要预设人工回复，直接用 `Command(resume=...)` 恢复即可（本仓库的回归验证就是用管道给 `input()` 喂数据）。
 
 ## 📊 与原 Demo 的对比
 
